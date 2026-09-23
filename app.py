@@ -6,7 +6,11 @@ import plotly.express as px
 import streamlit as st
 
 from aws_cost import get_monthly_costs
-from aws_analyzer import analyze_ec2
+from aws_analyzer import (
+    analyze_ec2,
+    analyze_ebs,
+    analyze_elastic_ips,
+)
 
 
 # ============================================================
@@ -44,13 +48,12 @@ if aws_profile != "personal":
     st.stop()
 
 
-# Verify the AWS identity actually being used
+# Verify the AWS identity actually being used.
+# This prevents CostLens from silently running against
+# an unexpected AWS account or credential configuration.
 try:
     sts = boto3.client("sts")
-    identity = sts.get_caller_identity()
-
-    aws_account_id = identity["Account"]
-    aws_arn = identity["Arn"]
+    sts.get_caller_identity()
 
 except Exception as e:
     st.error(f"Unable to verify AWS identity: {e}")
@@ -67,10 +70,6 @@ st.caption(
     "AWS Infrastructure Cost Optimization POC"
 )
 
-st.info(
-    #f"🔐 Connected AWS Account: **{aws_account_id}**  \n"
-    f"Profile: **{aws_profile}**"
-)
 
 st.divider()
 
@@ -92,6 +91,17 @@ def load_aws_costs():
 def load_ec2_analysis():
 
     return analyze_ec2()
+
+@st.cache_data(ttl=300)
+def load_ebs_analysis():
+    """Load potential orphaned EBS findings."""
+    return analyze_ebs()
+
+
+@st.cache_data(ttl=300)
+def load_elastic_ip_analysis():
+    """Load potential unused Elastic IP findings."""
+    return analyze_elastic_ips()
 
 
 # ============================================================
@@ -123,6 +133,40 @@ except Exception as e:
 
     st.error(
         f"Unable to retrieve EC2 / CloudWatch data: {e}"
+    )
+
+    st.stop()
+
+
+# ============================================================
+# LOAD EBS DATA
+# ============================================================
+
+try:
+
+    ebs_df = load_ebs_analysis()
+
+except Exception as e:
+
+    st.error(
+        f"Unable to retrieve EBS data: {e}"
+    )
+
+    st.stop()
+
+
+# ============================================================
+# LOAD ELASTIC IP DATA
+# ============================================================
+
+try:
+
+    elastic_ip_df = load_elastic_ip_analysis()
+
+except Exception as e:
+
+    st.error(
+        f"Unable to retrieve Elastic IP data: {e}"
     )
 
     st.stop()
@@ -357,19 +401,25 @@ else:
     # These are the fields we WANT to display.
     # Missing fields will be created automatically.
     display_columns = [
-        "instance_id",
-        "name",
-        "region",
-        "availability_zone",
-        "instance_type",
-        "state",
-        "average_cpu",
-        "minimum_cpu",
-        "maximum_cpu",
-        "cpu_datapoints",
-        "cpu_credit_balance",
-        "data_quality",
-    ]
+    "instance_id",
+    "name",
+    "region",
+    "availability_zone",
+    "instance_type",
+    "state",
+    "average_cpu",
+    "p95_cpu",
+    "maximum_cpu",
+    "network_in_gib_per_day",
+    "network_out_gib_per_day",
+    "disk_read_gib_per_day",
+    "disk_write_gib_per_day",
+    "cpu_credit_balance",
+    "cpu_credit_usage",
+    "cpu_datapoints",
+    "data_quality",
+    "optimization_status",
+]
 
     # Reindex instead of directly selecting columns.
     # This prevents KeyError when a field is missing.
@@ -382,12 +432,17 @@ else:
     # --------------------------------------------------------
 
     numeric_columns = [
-        "average_cpu",
-        "minimum_cpu",
-        "maximum_cpu",
-        "cpu_datapoints",
-        "cpu_credit_balance",
-    ]
+    "average_cpu",
+    "p95_cpu",
+    "maximum_cpu",
+    "network_in_gib_per_day",
+    "network_out_gib_per_day",
+    "disk_read_gib_per_day",
+    "disk_write_gib_per_day",
+    "cpu_credit_balance",
+    "cpu_credit_usage",
+    "cpu_datapoints",
+]
 
     for column in numeric_columns:
 
@@ -401,7 +456,7 @@ else:
     # Round CPU-related values
     for column in [
         "average_cpu",
-        "minimum_cpu",
+        "p95_cpu",
         "maximum_cpu",
         "cpu_credit_balance",
     ]:
@@ -415,21 +470,27 @@ else:
     # --------------------------------------------------------
 
     display_df = display_df.rename(
-        columns={
-            "instance_id": "Instance ID",
-            "name": "Name",
-            "region": "Region",
-            "availability_zone": "AZ",
-            "instance_type": "Type",
-            "state": "State",
-            "average_cpu": "Avg CPU %",
-            "minimum_cpu": "Min CPU %",
-            "maximum_cpu": "Max CPU %",
-            "cpu_datapoints": "CPU Datapoints",
-            "cpu_credit_balance": "CPU Credits",
-            "data_quality": "Data Quality",
-        }
-    )
+    columns={
+        "instance_id": "Instance ID",
+        "name": "Name",
+        "region": "Region",
+        "availability_zone": "AZ",
+        "instance_type": "Type",
+        "state": "State",
+        "average_cpu": "Avg CPU %",
+        "p95_cpu": "P95 CPU %",
+        "maximum_cpu": "Max CPU %",
+        "network_in_gib_per_day": "Network In GiB/day",
+        "network_out_gib_per_day": "Network Out GiB/day",
+        "disk_read_gib_per_day": "Disk Read GiB/day",
+        "disk_write_gib_per_day": "Disk Write GiB/day",
+        "cpu_credit_balance": "CPU Credits",
+        "cpu_credit_usage": "CPU Credit Usage",
+        "cpu_datapoints": "CPU Datapoints",
+        "data_quality": "Data Quality",
+        "optimization_status": "Optimization Status",
+    }
+)
 
     # Replace missing values with a clean UI representation
     display_df = display_df.fillna("—")
@@ -440,6 +501,98 @@ else:
         hide_index=True,
     )
 
+
+st.divider()
+
+st.subheader("💾 Storage Optimization")
+
+
+if ebs_df.empty:
+
+    st.success(
+        "No potentially orphaned EBS volumes detected."
+    )
+
+else:
+
+    st.warning(
+        f"{len(ebs_df)} potentially orphaned "
+        "EBS volume(s) require review."
+    )
+
+    ebs_display = ebs_df.reindex(
+    columns=[
+        "volume_id",
+        "region",
+        "volume_type",
+        "size_gb",
+        "state",
+        "age_days",
+        "optimization_status",
+        "optimization_reason",
+    ]
+    ).copy()
+
+    ebs_display = ebs_display.rename(
+        columns={
+            "volume_id": "Volume ID",
+            "region": "Region",
+            "volume_type": "Type",
+            "size_gb": "Size (GB)",
+            "state": "State",
+            "age_days": "Age (days)",
+            "optimization_status": "Signal",
+            "optimization_reason": "Reason",
+        }
+    )
+
+    st.dataframe(
+        ebs_display,
+        width="stretch",
+        hide_index=True,
+    )
+
+st.subheader("🌐 Network Resource Optimization")
+
+
+if elastic_ip_df.empty:
+
+    st.success(
+        "No potentially unused Elastic IPs detected."
+    )
+
+else:
+
+    st.warning(
+        f"{len(elastic_ip_df)} potentially unused "
+        "Elastic IP(s) require review."
+    )
+
+    eip_display = elastic_ip_df.reindex(
+    columns=[
+        "public_ip",
+        "region",
+        "allocation_id",
+        "optimization_status",
+        "optimization_reason",
+    ]
+    ).copy()
+
+    eip_display = eip_display.rename(
+        columns={
+            "public_ip": "Public IP",
+            "region": "Region",
+            "allocation_id": "Allocation ID",
+            "optimization_status": "Signal",
+            "optimization_reason": "Reason",
+        }
+    )
+
+    st.dataframe(
+        eip_display,
+        width="stretch",
+        hide_index=True,
+    )
 
 # ============================================================
 # OPTIMIZATION ANALYSIS
