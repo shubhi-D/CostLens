@@ -1,447 +1,692 @@
-import boto3
+"""
+CostLens EC2 analysis engine.
+
+This module converts raw AWS infrastructure and CloudWatch telemetry
+into structured optimization signals.
+
+Design principle:
+    Collection != Analysis
+
+AWS API modules collect facts.
+This module interprets those facts.
+The Streamlit application only presents the results.
+"""
+
+from datetime import datetime, timezone
+from typing import Dict, List, Optional
+
+import numpy as np
 import pandas as pd
 
-from datetime import datetime, timedelta, timezone
+from aws_metrics import get_ec2_metrics
+from aws_resources import (
+    get_ec2_instances,
+    get_ebs_volumes,
+    get_elastic_ips,
+)
+
+from config import (
+    LOW_CPU_AVERAGE_THRESHOLD,
+    LOW_CPU_P95_THRESHOLD,
+    LOW_CPU_MAX_THRESHOLD,
+    LOW_NETWORK_GIB_PER_DAY,
+    LOW_DISK_GIB_PER_DAY,
+    MIN_CPU_DATAPOINTS,
+    LOW_CPU_CREDIT_BALANCE,
+    STOPPED_INSTANCE_REVIEW_DAYS,
+    UNATTACHED_VOLUME_REVIEW_DAYS,
+)
 
 
 # ============================================================
-# CONFIGURATION
+# Utility functions
 # ============================================================
 
-LOOKBACK_HOURS = 24
-CPU_PERIOD = 300  # 5 minutes
-
-
-# ============================================================
-# EC2 INVENTORY
-# ============================================================
-
-def get_ec2_inventory():
-
-    session = boto3.Session()
-
-    # Used only to discover enabled regions
-    ec2_global = session.client(
-        "ec2",
-        region_name="us-east-1"
-    )
-
-    regions = ec2_global.describe_regions(
-        AllRegions=False
-    )["Regions"]
-
-    rows = []
-
-    for region_info in regions:
-
-        region = region_info["RegionName"]
-
-        print(f"Checking EC2 resources in {region}...")
-
-        ec2 = session.client(
-            "ec2",
-            region_name=region
-        )
-
-        response = ec2.describe_instances()
-
-        for reservation in response["Reservations"]:
-
-            for instance in reservation["Instances"]:
-
-                tags = {
-                    tag["Key"]: tag["Value"]
-                    for tag in instance.get("Tags", [])
-                }
-
-                rows.append({
-                    "instance_id": instance["InstanceId"],
-                    "name": tags.get("Name", ""),
-                    "region": region,
-                    "availability_zone": instance.get(
-                        "Placement", {}
-                    ).get("AvailabilityZone", ""),
-                    "instance_type": instance["InstanceType"],
-                    "state": instance["State"]["Name"],
-                    "launch_time": instance.get("LaunchTime"),
-                    "private_ip": instance.get(
-                        "PrivateIpAddress",
-                        ""
-                    ),
-                    "public_ip": instance.get(
-                        "PublicIpAddress",
-                        ""
-                    ),
-                    "architecture": instance.get(
-                        "Architecture",
-                        ""
-                    ),
-                    "platform": instance.get(
-                        "PlatformDetails",
-                        ""
-                    ),
-                })
-
-    return pd.DataFrame(rows)
-
-
-# ============================================================
-# CLOUDWATCH METRIC HELPER
-# ============================================================
-
-def get_metric_values(
-    cloudwatch,
-    instance_id,
-    metric_name,
-    statistic="Average"
-):
-
-    end_time = datetime.now(timezone.utc)
-
-    start_time = (
-        end_time
-        - timedelta(hours=LOOKBACK_HOURS)
-    )
-
-    response = cloudwatch.get_metric_data(
-
-        MetricDataQueries=[
-            {
-                "Id": "metricdata",
-
-                "MetricStat": {
-
-                    "Metric": {
-                        "Namespace": "AWS/EC2",
-                        "MetricName": metric_name,
-
-                        "Dimensions": [
-                            {
-                                "Name": "InstanceId",
-                                "Value": instance_id
-                            }
-                        ]
-                    },
-
-                    "Period": CPU_PERIOD,
-                    "Stat": statistic
-                },
-
-                "ReturnData": True
-            }
-        ],
-
-        StartTime=start_time,
-        EndTime=end_time,
-
-        ScanBy="TimestampAscending"
-    )
-
-    results = response.get(
-        "MetricDataResults",
-        []
-    )
-
-    if not results:
-        return []
-
-    return results[0].get(
-        "Values",
-        []
-    )
-
-
-# ============================================================
-# CPU METRICS
-# ============================================================
-
-def get_cpu_metrics(
-    instance_id,
-    region
-):
-
-    cloudwatch = boto3.client(
-        "cloudwatch",
-        region_name=region
-    )
-
-    values = get_metric_values(
-        cloudwatch=cloudwatch,
-        instance_id=instance_id,
-        metric_name="CPUUtilization",
-        statistic="Average"
-    )
-
-    if not values:
-
-        return {
-            "average_cpu": None,
-            "minimum_cpu": None,
-            "maximum_cpu": None,
-            "cpu_datapoints": 0
-        }
-
-    return {
-        "average_cpu": sum(values) / len(values),
-        "minimum_cpu": min(values),
-        "maximum_cpu": max(values),
-        "cpu_datapoints": len(values)
-    }
-
-
-# ============================================================
-# CPU CREDIT METRICS
-# ============================================================
-
-def get_cpu_credit_balance(
-    instance_id,
-    region
-):
-
-    cloudwatch = boto3.client(
-        "cloudwatch",
-        region_name=region
-    )
-
-    values = get_metric_values(
-        cloudwatch=cloudwatch,
-        instance_id=instance_id,
-        metric_name="CPUCreditBalance",
-        statistic="Average"
-    )
+def _safe_mean(values: List[float]) -> Optional[float]:
+    """Return the mean of numeric values or None."""
 
     if not values:
         return None
 
-    # Most recent value
-    return values[-1]
+    numeric_values = pd.to_numeric(
+        values,
+        errors="coerce",
+    )
+
+    numeric_values = numeric_values[
+        ~pd.isna(numeric_values)
+    ]
+
+    if len(numeric_values) == 0:
+        return None
+
+    return float(
+        np.mean(numeric_values)
+    )
 
 
-# ============================================================
-# DATA QUALITY
-# ============================================================
+def _safe_percentile(
+    values: List[float],
+    percentile: float,
+) -> Optional[float]:
+    """Return a percentile or None when no usable data exists."""
 
-def determine_data_quality(
-    state,
-    cpu_datapoints
-):
+    if not values:
+        return None
 
-    if state != "running":
+    numeric_values = pd.to_numeric(
+        values,
+        errors="coerce",
+    )
 
-        return "Not applicable"
+    numeric_values = numeric_values[
+        ~pd.isna(numeric_values)
+    ]
+
+    if len(numeric_values) == 0:
+        return None
+
+    return float(
+        np.percentile(
+            numeric_values,
+            percentile,
+        )
+    )
+
+
+def _safe_sum(values: List[float]) -> float:
+    """Return the sum of numeric values."""
+
+    if not values:
+        return 0.0
+
+    numeric_values = pd.to_numeric(
+        values,
+        errors="coerce",
+    )
+
+    numeric_values = numeric_values[
+        ~pd.isna(numeric_values)
+    ]
+
+    if len(numeric_values) == 0:
+        return 0.0
+
+    return float(
+        np.sum(numeric_values)
+    )
+
+
+def _bytes_to_gib(value: float) -> float:
+    """Convert bytes to GiB."""
+
+    return value / (
+        1024 ** 3
+    )
+
+
+def _calculate_data_quality(
+    cpu_datapoints: int,
+) -> str:
+    """
+    Determine whether enough CPU telemetry exists to make
+    utilization-based recommendations.
+    """
 
     if cpu_datapoints == 0:
-
         return "No data"
 
-    if cpu_datapoints < 10:
-
+    if cpu_datapoints < MIN_CPU_DATAPOINTS:
         return "Insufficient"
 
-    if cpu_datapoints < 100:
+    expected_points = (
+        7 * 24 * 60
+    ) / 5
 
+    if cpu_datapoints < expected_points * 0.50:
         return "Limited"
 
     return "Good"
 
 
 # ============================================================
-# OPTIMIZATION SIGNAL
+# EC2 analysis
 # ============================================================
 
-def determine_optimization_status(row):
+def _analyze_single_instance(
+    instance: pd.Series,
+) -> Dict:
+    """
+    Analyze one EC2 instance using CloudWatch telemetry.
 
-    # Never analyze terminated/stopped resources
-    if row["state"] != "running":
+    Returns a normalized dictionary that can be consumed by
+    the dashboard or future APIs.
+    """
 
-        return "Not applicable"
+    instance_id = instance["instance_id"]
+    region = instance["region"]
+    state = instance["state"]
 
-    # Don't make recommendations without enough data
-    if row["data_quality"] in [
-        "No data",
-        "Insufficient"
-    ]:
+    result = instance.to_dict()
 
-        return "Insufficient monitoring data"
+    # --------------------------------------------------------
+    # Non-running instances
+    # --------------------------------------------------------
 
-    average_cpu = row["average_cpu"]
-    maximum_cpu = row["maximum_cpu"]
+    if state != "running":
 
-    if average_cpu is None:
-
-        return "Insufficient monitoring data"
-
-    # Conservative first rule
-    if (
-        average_cpu < 10
-        and maximum_cpu < 30
-    ):
-
-        return (
-            "Potential low-utilization "
-            "optimization opportunity"
-        )
-
-    return "No obvious CPU optimization signal"
-
-
-# ============================================================
-# COMPLETE EC2 ANALYSIS
-# ============================================================
-
-def analyze_ec2():
-
-    instances = get_ec2_inventory()
-
-    if instances.empty:
-
-        return instances
-
-    analysis_rows = []
-
-    for _, row in instances.iterrows():
-
-        instance_id = row["instance_id"]
-        region = row["region"]
-        state = row["state"]
-
-        # ----------------------------------------------------
-        # Don't query CloudWatch for terminated instances
-        # ----------------------------------------------------
-
-        if state != "running":
-
-            analysis_rows.append({
+        result.update(
+            {
                 "average_cpu": None,
                 "minimum_cpu": None,
                 "maximum_cpu": None,
+                "p95_cpu": None,
                 "cpu_datapoints": 0,
-                "cpu_credit_balance": None
-            })
-
-            continue
-
-        print(
-            f"Getting CPU metrics for "
-            f"{instance_id}..."
+                "network_in_gib_per_day": None,
+                "network_out_gib_per_day": None,
+                "disk_read_gib_per_day": None,
+                "disk_write_gib_per_day": None,
+                "cpu_credit_balance": None,
+                "cpu_credit_usage": None,
+                "data_quality": "Not applicable",
+                "optimization_status": (
+                    "Not applicable for non-running instance"
+                ),
+                "optimization_reason": (
+                    "Instance is not currently running."
+                ),
+            }
         )
 
-        # ----------------------------------------------------
-        # CPU
-        # ----------------------------------------------------
+        return result
 
-        cpu = get_cpu_metrics(
-            instance_id,
-            region
+    # --------------------------------------------------------
+    # CloudWatch metrics
+    # --------------------------------------------------------
+
+    metrics = get_ec2_metrics(
+        instance_id=instance_id,
+        region=region,
+    )
+
+    cpu_values = metrics.get(
+        "cpu",
+        [],
+    )
+
+    network_in_values = metrics.get(
+        "network_in",
+        [],
+    )
+
+    network_out_values = metrics.get(
+        "network_out",
+        [],
+    )
+
+    disk_read_values = metrics.get(
+        "disk_read",
+        [],
+    )
+
+    disk_write_values = metrics.get(
+        "disk_write",
+        [],
+    )
+
+    cpu_credit_balance_values = metrics.get(
+        "cpu_credit_balance",
+        [],
+    )
+
+    cpu_credit_usage_values = metrics.get(
+        "cpu_credit_usage",
+        [],
+    )
+
+    # --------------------------------------------------------
+    # CPU statistics
+    # --------------------------------------------------------
+
+    average_cpu = _safe_mean(
+        cpu_values
+    )
+
+    minimum_cpu = (
+        min(cpu_values)
+        if cpu_values
+        else None
+    )
+
+    maximum_cpu = (
+        max(cpu_values)
+        if cpu_values
+        else None
+    )
+
+    p95_cpu = _safe_percentile(
+        cpu_values,
+        95,
+    )
+
+    cpu_datapoints = len(
+        cpu_values
+    )
+
+    data_quality = _calculate_data_quality(
+        cpu_datapoints
+    )
+
+    # --------------------------------------------------------
+    # Network statistics
+    #
+    # NetworkIn/NetworkOut are returned as bytes per
+    # CloudWatch period when using Sum.
+    #
+    # We normalize the observation window to GiB/day.
+    # --------------------------------------------------------
+
+    total_network_in = _safe_sum(
+        network_in_values
+    )
+
+    total_network_out = _safe_sum(
+        network_out_values
+    )
+
+    observation_days = 7
+
+    network_in_gib_per_day = (
+        _bytes_to_gib(
+            total_network_in
         )
+        / observation_days
+    )
 
-        # ----------------------------------------------------
-        # CPU credits
-        # ----------------------------------------------------
+    network_out_gib_per_day = (
+        _bytes_to_gib(
+            total_network_out
+        )
+        / observation_days
+    )
 
-        cpu_credit_balance = None
+    # --------------------------------------------------------
+    # Disk statistics
+    # --------------------------------------------------------
 
-        # CPU credit metrics are relevant to
-        # burstable instances such as T3.
-        if row["instance_type"].startswith(
-            ("t2.", "t3.", "t3a.")
-        ):
+    total_disk_read = _safe_sum(
+        disk_read_values
+    )
 
-            cpu_credit_balance = (
-                get_cpu_credit_balance(
-                    instance_id,
-                    region
-                )
-            )
+    total_disk_write = _safe_sum(
+        disk_write_values
+    )
 
-        analysis_rows.append({
+    disk_read_gib_per_day = (
+        _bytes_to_gib(
+            total_disk_read
+        )
+        / observation_days
+    )
 
-            "average_cpu": cpu["average_cpu"],
+    disk_write_gib_per_day = (
+        _bytes_to_gib(
+            total_disk_write
+        )
+        / observation_days
+    )
 
-            "minimum_cpu": cpu["minimum_cpu"],
+    # --------------------------------------------------------
+    # CPU credits
+    # --------------------------------------------------------
 
-            "maximum_cpu": cpu["maximum_cpu"],
+    cpu_credit_balance = _safe_mean(
+        cpu_credit_balance_values
+    )
 
-            "cpu_datapoints": cpu["cpu_datapoints"],
+    cpu_credit_usage = _safe_sum(
+        cpu_credit_usage_values
+    )
 
+    # --------------------------------------------------------
+    # Optimization analysis
+    # --------------------------------------------------------
+
+    status, reason = _generate_ec2_signal(
+        instance_type=instance[
+            "instance_type"
+        ],
+        average_cpu=average_cpu,
+        p95_cpu=p95_cpu,
+        maximum_cpu=maximum_cpu,
+        network_in_gib_per_day=(
+            network_in_gib_per_day
+            + network_out_gib_per_day
+        ),
+        disk_gib_per_day=(
+            disk_read_gib_per_day
+            + disk_write_gib_per_day
+        ),
+        cpu_credit_balance=cpu_credit_balance,
+        data_quality=data_quality,
+    )
+
+    result.update(
+        {
+            "average_cpu": average_cpu,
+            "minimum_cpu": minimum_cpu,
+            "maximum_cpu": maximum_cpu,
+            "p95_cpu": p95_cpu,
+            "cpu_datapoints": cpu_datapoints,
+            "network_in_gib_per_day": (
+                network_in_gib_per_day
+            ),
+            "network_out_gib_per_day": (
+                network_out_gib_per_day
+            ),
+            "disk_read_gib_per_day": (
+                disk_read_gib_per_day
+            ),
+            "disk_write_gib_per_day": (
+                disk_write_gib_per_day
+            ),
             "cpu_credit_balance": (
                 cpu_credit_balance
-            )
-        })
-
-    metrics_df = pd.DataFrame(
-        analysis_rows
-    )
-
-    result = pd.concat(
-        [
-            instances.reset_index(drop=True),
-            metrics_df
-        ],
-        axis=1
-    )
-
-    # --------------------------------------------------------
-    # Data quality
-    # --------------------------------------------------------
-
-    result["data_quality"] = result.apply(
-        lambda row: determine_data_quality(
-            row["state"],
-            row["cpu_datapoints"]
-        ),
-        axis=1
-    )
-
-    # --------------------------------------------------------
-    # Optimization status
-    # --------------------------------------------------------
-
-    result["optimization_status"] = result.apply(
-        determine_optimization_status,
-        axis=1
+            ),
+            "cpu_credit_usage": (
+                cpu_credit_usage
+            ),
+            "data_quality": data_quality,
+            "optimization_status": status,
+            "optimization_reason": reason,
+        }
     )
 
     return result
 
 
-# ============================================================
-# MAIN
-# ============================================================
+def _generate_ec2_signal(
+    instance_type: str,
+    average_cpu: Optional[float],
+    p95_cpu: Optional[float],
+    maximum_cpu: Optional[float],
+    network_in_gib_per_day: float,
+    disk_gib_per_day: float,
+    cpu_credit_balance: Optional[float],
+    data_quality: str,
+) -> tuple[str, str]:
+    """
+    Generate a conservative EC2 optimization signal.
 
-if __name__ == "__main__":
+    The engine deliberately avoids making recommendations when
+    telemetry quality is insufficient.
 
-    df = analyze_ec2()
+    This function does NOT estimate savings and does NOT perform
+    any AWS changes.
+    """
 
-    print(
-        "\n=== COSTLENS REAL EC2 ANALYSIS ===\n"
+    if data_quality in {
+        "No data",
+        "Insufficient",
+    }:
+
+        return (
+            "Insufficient monitoring data",
+            "More CloudWatch history is required before generating "
+            "a utilization-based optimization signal.",
+        )
+
+    if (
+        average_cpu is None
+        or p95_cpu is None
+        or maximum_cpu is None
+    ):
+
+        return (
+            "Insufficient monitoring data",
+            "Required CPU statistics are unavailable.",
+        )
+
+    # --------------------------------------------------------
+    # CPU evidence
+    # --------------------------------------------------------
+
+    cpu_is_low = (
+        average_cpu
+        < LOW_CPU_AVERAGE_THRESHOLD
+        and p95_cpu
+        < LOW_CPU_P95_THRESHOLD
+        and maximum_cpu
+        < LOW_CPU_MAX_THRESHOLD
     )
 
-    if df.empty:
+    # --------------------------------------------------------
+    # Network evidence
+    # --------------------------------------------------------
 
-        print("No EC2 instances found.")
+    network_is_low = (
+        network_in_gib_per_day
+        < LOW_NETWORK_GIB_PER_DAY
+    )
 
-    else:
+    # --------------------------------------------------------
+    # Disk evidence
+    # --------------------------------------------------------
 
-        # Display important columns first
-        columns = [
-            "instance_id",
-            "name",
-            "region",
-            "availability_zone",
-            "instance_type",
-            "state",
-            "average_cpu",
-            "minimum_cpu",
-            "maximum_cpu",
-            "cpu_datapoints",
-            "cpu_credit_balance",
-            "data_quality",
-            "optimization_status"
-        ]
+    disk_is_low = (
+        disk_gib_per_day
+        < LOW_DISK_GIB_PER_DAY
+    )
 
-        print(
-            df[columns].to_string(
-                index=False
+    # --------------------------------------------------------
+    # CPU credit evidence
+    # --------------------------------------------------------
+
+    burstable_instance = (
+        instance_type.startswith("t2.")
+        or instance_type.startswith("t3.")
+        or instance_type.startswith("t3a.")
+    )
+
+    healthy_cpu_credits = True
+
+    if (
+        burstable_instance
+        and cpu_credit_balance is not None
+    ):
+
+        healthy_cpu_credits = (
+            cpu_credit_balance
+            >= LOW_CPU_CREDIT_BALANCE
+        )
+
+    # --------------------------------------------------------
+    # Stronger multi-signal opportunity
+    # --------------------------------------------------------
+
+    if (
+        cpu_is_low
+        and network_is_low
+        and disk_is_low
+        and healthy_cpu_credits
+    ):
+
+        return (
+            "Potential low-utilization optimization opportunity",
+            (
+                f"CPU utilization is consistently low "
+                f"(avg={average_cpu:.2f}%, "
+                f"P95={p95_cpu:.2f}%, "
+                f"max={maximum_cpu:.2f}%). "
+                f"Network and disk activity are also low. "
+                f"Review whether the current instance type is "
+                f"larger than the workload requires."
+            ),
+        )
+
+    # --------------------------------------------------------
+    # CPU-only signal
+    # --------------------------------------------------------
+
+    if cpu_is_low:
+
+        return (
+            "Potential CPU rightsizing opportunity",
+            (
+                f"CPU utilization is consistently low "
+                f"(avg={average_cpu:.2f}%, "
+                f"P95={p95_cpu:.2f}%, "
+                f"max={maximum_cpu:.2f}%), "
+                "but other resource signals do not provide "
+                "enough evidence for a stronger recommendation."
+            ),
+        )
+
+    # --------------------------------------------------------
+    # No obvious signal
+    # --------------------------------------------------------
+
+    return (
+        "No obvious optimization signal",
+        (
+            f"Observed CPU utilization does not meet the "
+            f"current low-utilization thresholds "
+            f"(avg={average_cpu:.2f}%, "
+            f"P95={p95_cpu:.2f}%, "
+            f"max={maximum_cpu:.2f}%)."
+        ),
+    )
+
+
+# ============================================================
+# Public EC2 analysis API
+# ============================================================
+
+def analyze_ec2() -> pd.DataFrame:
+    """
+    Discover and analyze all EC2 instances.
+
+    Returns
+    -------
+    pandas.DataFrame
+        Enriched EC2 inventory containing utilization metrics
+        and optimization signals.
+    """
+
+    instances = get_ec2_instances()
+
+    if instances.empty:
+
+        return pd.DataFrame()
+
+    analyzed_instances = []
+
+    for _, instance in instances.iterrows():
+
+        analyzed_instances.append(
+            _analyze_single_instance(
+                instance
             )
         )
+
+    return pd.DataFrame(
+        analyzed_instances
+    )
+
+
+# ============================================================
+# EBS analysis
+# ============================================================
+
+def analyze_ebs() -> pd.DataFrame:
+    """
+    Identify potentially orphaned EBS volumes.
+
+    No destructive action is taken.
+    """
+
+    volumes = get_ebs_volumes()
+
+    if volumes.empty:
+
+        return pd.DataFrame()
+
+    now = datetime.now(
+        timezone.utc
+    )
+
+    volumes = volumes.copy()
+
+    volumes["create_time"] = pd.to_datetime(
+        volumes["create_time"],
+        errors="coerce",
+        utc=True,
+    )
+
+    volumes["age_days"] = (
+        now
+        - volumes["create_time"]
+    ).dt.days
+
+    orphaned = volumes[
+        volumes["attached_instance_id"].isna()
+        & (
+            volumes["age_days"]
+            >= UNATTACHED_VOLUME_REVIEW_DAYS
+        )
+    ].copy()
+
+    if orphaned.empty:
+
+        return pd.DataFrame()
+
+    orphaned[
+        "optimization_status"
+    ] = "Potential orphaned EBS volume"
+
+    orphaned[
+        "optimization_reason"
+    ] = (
+        "Volume is unattached and has remained "
+        "unattached beyond the configured review period."
+    )
+
+    return orphaned
+
+
+# ============================================================
+# Elastic IP analysis
+# ============================================================
+
+def analyze_elastic_ips() -> pd.DataFrame:
+    """
+    Identify Elastic IP addresses that are not associated
+    with an EC2 resource.
+    """
+
+    addresses = get_elastic_ips()
+
+    if addresses.empty:
+
+        return pd.DataFrame()
+
+    unused = addresses[
+        addresses["association_id"].isna()
+    ].copy()
+
+    if unused.empty:
+
+        return pd.DataFrame()
+
+    unused[
+        "optimization_status"
+    ] = "Potential unused Elastic IP"
+
+    unused[
+        "optimization_reason"
+    ] = (
+        "Elastic IP is currently not associated "
+        "with an AWS resource. Review whether it is required."
+    )
+
+    return unused
