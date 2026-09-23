@@ -1,0 +1,7 @@
+date,service,resource,cost
+2026-09-01,EC2,i-001,42.50
+2026-09-01,EC2,i-002,18.30
+2026-09-01,RDS,prod-db,35.20
+2026-09-01,S3,bucket-prod,5.40
+2026-09-01,VPC,nat-gateway-1,22.10
+2026-09-01,CloudWatch,logs,8.20

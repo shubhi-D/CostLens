@@ -1,0 +1,7 @@
+resource,service,environment,cpu_utilization,memory_utilization,state
+i-001,EC2,dev,4.2,12.5,running
+i-002,EC2,prod,58.4,63.2,running
+prod-db,RDS,prod,72.1,68.4,running
+nat-gateway-1,VPC,prod,35.2,41.0,running
+bucket-prod,S3,prod,0,0,active
+logs,CloudWatch,prod,0,0,active
